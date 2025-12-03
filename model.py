@@ -152,6 +152,27 @@ class SalesEDA:
         plt.title("Seasonality: Global Sales Distribution by Month")
         plt.savefig("visualizations/seasonality_boxplot.png")
 
+    def plot_distribution(self, column: str, without_zeros: bool = False, without_outliers: bool = False):
+        """Plots distribution of a specified column."""
+        logger.info(f"Plotting distribution for {column}...")
+        plt.figure()
+        df_temp = self.df.copy()
+
+        if without_outliers:
+            q1 = df_temp[column].quantile(0.01)
+            q99 = df_temp[column].quantile(0.99)
+            df_temp = df_temp[(df_temp[column] >= q1) & (df_temp[column] <= q99)]
+
+        if without_zeros:
+            df_temp = df_temp[df_temp[column] > 0]
+            sns.histplot(df_temp[column], bins=50, kde=True, color='skyblue')
+            plt.title(f'Distribution of {column} (without zeros)')
+            plt.savefig(f"visualizations/distribution_{column}_without_zeros.png")
+        else:
+            sns.histplot(df_temp[column], bins=50, kde=True, color='skyblue')
+            plt.title(f'Distribution of {column}')
+            plt.savefig(f"visualizations/distribution_{column}.png")
+
     def plot_feature_correlations(self, feature_df: pd.DataFrame, target_col: str = 'quantity'):
         """Plots correlation heatmap for engineered features."""
         logger.info("Plotting feature correlations...")
@@ -307,9 +328,9 @@ class EnsembleModelManager:
                     random_state=seed, n_jobs=n_jobs, verbosity=-1
                 ),
                 'xgb': xgb.XGBRegressor(
-                    objective='reg:squarederror', learning_rate=0.05,
-                    max_depth=8, n_estimators=2000, random_state=seed, n_jobs=n_jobs,
-                    enable_categorical=True
+                    objective='reg:tweedie', tweedie_variance_power=1.5,
+                    learning_rate=0.05, max_depth=8, n_estimators=2000, 
+                    random_state=seed, n_jobs=n_jobs, enable_categorical=True
                 ),
                 'catboost': CatBoostRegressor(
                     loss_function='Tweedie:variance_power=1.5', learning_rate=0.05,
@@ -651,6 +672,21 @@ class SalesForecastingPipeline:
             df[f'roll_mean_{w}'] = df.groupby(group_cols)['quantity'].transform(
                 lambda x: x.shift(1).rolling(w, min_periods=1).mean()
             ).fillna(0)
+
+        # NEW: Add "Months Since Last Sale" 
+        # (Helps model understand if a product has been 'dead' for a while)
+        df['is_zero_sale'] = (df['quantity'] == 0).astype(int)
+        
+        # Calculate consecutive months with zero sales
+        # (This requires a bit of pandas groupby magic or a rolling sum of the boolean)
+        df['rolling_zero_count_6'] = df.groupby(group_cols)['is_zero_sale'].transform(
+            lambda x: x.shift(1).rolling(6).sum()
+        ).fillna(0)
+
+        # NEW: Probability of Sale (Mean encoding of non-zeros over window)
+        df['sale_probability_12'] = df.groupby(group_cols)['is_zero_sale'].transform(
+            lambda x: 1 - x.shift(1).rolling(12).mean()
+        ).fillna(0)
             
         # Date Features
         df['month'] = df['date'].dt.month
@@ -772,6 +808,11 @@ class SalesForecastingPipeline:
         
         # 3. Seasonality
         eda.plot_seasonality()
+
+        # 4. Distribution of Target
+        eda.plot_distribution('quantity', without_zeros=False, without_outliers=True)
+
+
         
         # 4. Correlation (Uses the engineered grid)
         # We sample the grid to avoid memory issues with huge plots
