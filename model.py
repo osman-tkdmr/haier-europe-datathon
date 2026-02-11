@@ -2,7 +2,7 @@
 Sales Forecasting Pipeline with Ensemble Models & Time Series Cross-Validation
 ============================================================================
 Optimized pipeline for forecasting product and category-level sales 
-using ensemble methods (LightGBM, XGBoost, CatBoost, LSTM).
+using ensemble methods (RandomForest, LightGBM, XGBoost, CatBoost, LSTM).
 
 Key Features:
 - Time Series Cross-Validation (Expanding Window).
@@ -72,6 +72,7 @@ class PipelineConfig:
     ROLLING_WINDOWS: List[int] = field(default_factory=lambda: [3, 6, 12])
 
     RUN_EDA: bool = True
+    BASELINE_GROUP_WMAPE: float = 0.8775865632406377
 
 # Logging Setup
 logging.basicConfig(
@@ -91,6 +92,53 @@ def rwmape(y_true: np.ndarray, y_pred: np.ndarray, gamma: float = 0.8, lam: floa
     num = np.sum(np.abs(y_true - y_pred)) + lam * np.abs(np.sum(y_true) - np.sum(y_pred))
     den = np.sum(np.abs(y_true)) + gamma * np.sum(np.abs(y_pred)) + eps
     return float(num / den)
+
+def group_wmape(df: pd.DataFrame, group_cols, target_col: str, pred_col: str,
+                gamma: float = 0.8, lam: float = 0.2, eps: float = 1e-9) -> float:
+    """Mean rWMAPE across groups; skip (sum_y==0 & sum_yhat==0), penalize (sum_y==0 & sum_yhat>0) as 1.0."""
+    scores = []
+    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0.0).astype(float)
+    p = pd.to_numeric(df[pred_col], errors="coerce").fillna(0.0).astype(float)
+    work = df.copy()
+    work[target_col] = y.values
+    work[pred_col] = p.values
+
+    for _, g in work.groupby(list(group_cols), sort=False, dropna=False):
+        y_g = g[target_col].to_numpy(dtype=float)
+        p_g = g[pred_col].to_numpy(dtype=float)
+        sum_true = float(np.sum(np.abs(y_g)))
+        sum_pred = float(np.sum(np.abs(p_g)))
+        if sum_true == 0.0 and sum_pred == 0.0:
+            continue
+        if sum_true == 0.0 and sum_pred > 0.0:
+            scores.append(1.0)
+        else:
+            scores.append(rwmape(y_g, p_g, gamma=gamma, lam=lam, eps=eps))
+    return float(np.mean(scores)) if scores else 0.0
+
+def calculate_score(solution: pd.DataFrame,
+          submission: pd.DataFrame,
+          target_col: str = "quantity",
+          group_cols = ("unique_code",),
+          row_id_col: str | None = None,
+          baseline_group_wmape: float = PipelineConfig.BASELINE_GROUP_WMAPE,
+          gamma: float = 0.8, lam: float = 0.2, eps: float = 1e-9) -> float:
+    """Higher-is-better leaderboard score = baseline / (Group-rWMAPE + eps)."""
+    if row_id_col:
+        merged = pd.merge(
+            solution,
+            submission[[row_id_col, target_col]].rename(columns={target_col: f"{target_col}_pred"}),
+            on=row_id_col, how="inner", validate="one_to_one"
+        )
+    else:
+        if len(solution) != len(submission):
+            raise ValueError("Without row_id_col, solution and submission must have same length.")
+        merged = solution.copy()
+        merged[f"{target_col}_pred"] = submission[target_col].values
+
+    gw = group_wmape(merged, group_cols=group_cols, target_col=target_col,
+                     pred_col=f"{target_col}_pred", gamma=gamma, lam=lam, eps=eps)
+    return float(baseline_group_wmape / (gw + eps))
 
 # ============================================================================
 # EXPLORATORY DATA ANALYSIS
@@ -673,7 +721,7 @@ class SalesForecastingPipeline:
                 lambda x: x.shift(1).rolling(w, min_periods=1).mean()
             ).fillna(0)
 
-        # NEW: Add "Months Since Last Sale" 
+        # Add "Months Since Last Sale" 
         # (Helps model understand if a product has been 'dead' for a while)
         df['is_zero_sale'] = (df['quantity'] == 0).astype(int)
         
@@ -683,7 +731,7 @@ class SalesForecastingPipeline:
             lambda x: x.shift(1).rolling(6).sum()
         ).fillna(0)
 
-        # NEW: Probability of Sale (Mean encoding of non-zeros over window)
+        # Probability of Sale (Mean encoding of non-zeros over window)
         df['sale_probability_12'] = df.groupby(group_cols)['is_zero_sale'].transform(
             lambda x: 1 - x.shift(1).rolling(12).mean()
         ).fillna(0)
